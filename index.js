@@ -1,628 +1,901 @@
-require('dotenv').config();
 
-const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
+require("dotenv").config();
+
+const TelegramBot = require("node-telegram-bot-api");
+const axios = require("axios");
+
+// =====================================================
+// CONFIG
+// =====================================================
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const BIN_ID = process.env.BIN_ID;
-const MASTER_KEY = process.env.MASTER_KEY;
+const BIN_ID = process.env.JSONBIN_BIN_ID || process.env.BIN_ID;
+const MASTER_KEY = process.env.JSONBIN_MASTER_KEY || process.env.MASTER_KEY;
 
-if (!BOT_TOKEN || !BIN_ID || !MASTER_KEY) {
-  console.error('Thiếu BOT_TOKEN, BIN_ID hoặc MASTER_KEY trong Railway Variables.');
-  process.exit(1);
+const SHOP_NAME = process.env.SHOP_NAME || "SHOP";
+const BANK_CODE = process.env.BANK_CODE || "";
+const BANK_ACCOUNT = process.env.BANK_ACCOUNT || "";
+const BANK_ACCOUNT_NAME = process.env.BANK_ACCOUNT_NAME || "";
+
+if (!BOT_TOKEN) throw new Error("Thiếu biến BOT_TOKEN");
+if (!BIN_ID) throw new Error("Thiếu JSONBIN_BIN_ID hoặc BIN_ID");
+if (!MASTER_KEY) throw new Error("Thiếu JSONBIN_MASTER_KEY hoặc MASTER_KEY");
+
+// =====================================================
+// TELEGRAM
+// Không bật polling tự động.
+// Bot sẽ tự gọi getUpdates và xử lý retry_after.
+// =====================================================
+
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: false
+});
+
+const sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+function getTelegramRetryAfter(err) {
+  return (
+    err?.response?.body?.parameters?.retry_after ||
+    err?.response?.body?.parameters?.retryAfter ||
+    err?.response?.data?.parameters?.retry_after ||
+    err?.response?.data?.parameters?.retryAfter ||
+    0
+  );
 }
 
-// Chỉ chạy một tiến trình polling cho mỗi BOT_TOKEN.
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: {
-    interval: 1000,
-    autoStart: true,
-    params: {
-      timeout: 10
-    },
-    retryTimeout: 5000
+function getTelegramErrorCode(err) {
+  return (
+    err?.response?.body?.error_code ||
+    err?.response?.data?.error_code ||
+    err?.code ||
+    0
+  );
+}
+
+// Gọi Telegram API có retry khi bị giới hạn 429.
+async function telegramCall(fn, label = "Telegram API") {
+  let attempt = 0;
+
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      attempt++;
+
+      const code = getTelegramErrorCode(err);
+      const retryAfter = Number(getTelegramRetryAfter(err)) || 0;
+
+      if (code === 429 || retryAfter > 0) {
+        const waitMs = Math.max(retryAfter * 1000, 1000) + 1000;
+
+        console.warn(
+          `${label}: Telegram 429, chờ ${Math.ceil(waitMs / 1000)} giây`
+        );
+
+        await sleep(waitMs);
+        continue;
+      }
+
+      if (attempt < 4 && (code === 500 || code === 502 || code === 503)) {
+        await sleep(attempt * 3000);
+        continue;
+      }
+
+      throw err;
+    }
+  }
+}
+
+async function sendMessage(chatId, text, options = {}) {
+  return telegramCall(
+    () => bot.sendMessage(chatId, text, options),
+    "sendMessage"
+  );
+}
+
+async function answerCallback(callbackId, text = "") {
+  return telegramCall(
+    () =>
+      bot.answerCallbackQuery(callbackId, {
+        text: text || undefined,
+        show_alert: false
+      }),
+    "answerCallbackQuery"
+  );
+}
+
+async function sendPhoto(chatId, photo, options = {}) {
+  return telegramCall(
+    () => bot.sendPhoto(chatId, photo, options),
+    "sendPhoto"
+  );
+}
+
+// =====================================================
+// JSONBIN
+// =====================================================
+
+const BIN_URL = `https://api.jsonbin.io/v3/b/${BIN_ID}`;
+
+const binClient = axios.create({
+  timeout: 20000,
+  headers: {
+    "Content-Type": "application/json",
+    "X-Master-Key": MASTER_KEY
   }
 });
 
-const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${BIN_ID}`;
-
-const headers = {
-  'Content-Type': 'application/json',
-  'X-Master-Key': MASTER_KEY
-};
-
-// ==================== JSONBIN ====================
+function defaultData() {
+  return {
+    version: 1,
+    products: [],
+    adminTelegramIds: [],
+    orders: [],
+    settings: {}
+  };
+}
 
 async function getData() {
-  try {
-    const res = await axios.get(`${JSONBIN_URL}/latest`, {
-      headers,
-      timeout: 15000
-    });
+  const response = await binClient.get(`${BIN_URL}/latest`);
+  const data = response.data?.record;
 
-    const data = res.data.record || {};
+  if (!data || typeof data !== "object") {
+    throw new Error("JSONBin không trả về dữ liệu hợp lệ");
+  }
 
-    if (!Array.isArray(data.products)) {
-      data.products = [];
-    }
+  if (!Array.isArray(data.products)) data.products = [];
+  if (!Array.isArray(data.orders)) data.orders = [];
+  if (!Array.isArray(data.adminTelegramIds)) {
+    data.adminTelegramIds = [];
+  }
+  if (!data.settings || typeof data.settings !== "object") {
+    data.settings = {};
+  }
 
-    if (!Array.isArray(data.orders)) {
-      data.orders = [];
-    }
+  return data;
+}
 
-    if (!Array.isArray(data.adminIds)) {
-      data.adminIds = [];
-    }
+// Xếp hàng các lần ghi để tránh ghi đè dữ liệu lẫn nhau.
+let writeQueue = Promise.resolve();
+
+function updateData(mutator) {
+  const task = writeQueue.then(async () => {
+    const data = await getData();
+
+    await mutator(data);
+
+    await binClient.put(BIN_URL, data);
 
     return data;
-  } catch (err) {
-    console.error(
-      'Lỗi đọc JSONBin:',
-      err.response?.status || err.message
-    );
+  });
 
-    return null;
-  }
+  writeQueue = task.catch((err) => {
+    console.error("Lỗi ghi JSONBin:", err.message);
+  });
+
+  return task;
 }
 
-async function saveData(data) {
-  try {
-    await axios.put(JSONBIN_URL, data, {
-      headers,
-      timeout: 15000
-    });
+// =====================================================
+// HELPERS
+// =====================================================
 
-    return true;
-  } catch (err) {
-    console.error(
-      'Lỗi ghi JSONBin:',
-      err.response?.status || err.message
-    );
-
-    return false;
-  }
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
-// ==================== TIỆN ÍCH ====================
+function money(value) {
+  const number = Number(value) || 0;
 
-function formatMoney(amount) {
-  return Number(amount || 0).toLocaleString('vi-VN') + 'đ';
+  return number.toLocaleString("vi-VN") + "đ";
 }
 
-function generateOrderId() {
+function getUserName(user) {
+  if (user.username) return `@${user.username}`;
+
+  const name = [user.first_name, user.last_name]
+    .filter(Boolean)
+    .join(" ");
+
+  return name || "Khách hàng";
+}
+
+function isAdmin(data, userId) {
+  return (data.adminTelegramIds || []).some(
+    (id) => String(id) === String(userId)
+  );
+}
+
+function findProduct(data, productId) {
+  return (data.products || []).find(
+    (product) => String(product.id) === String(productId)
+  );
+}
+
+function findType(product, typeId) {
+  return (product?.types || []).find(
+    (type) => String(type.id) === String(typeId)
+  );
+}
+
+function getStock(type) {
+  const stock = Number(type?.stock);
+
+  if (!Number.isFinite(stock)) return 0;
+
+  return Math.max(0, stock);
+}
+
+function getProductDescription(product) {
+  return product.description || "Không có mô tả.";
+}
+
+function makeOrderId() {
   return (
-    'ORD' +
     Date.now().toString(36).toUpperCase() +
     Math.random().toString(36).slice(2, 6).toUpperCase()
   );
 }
 
-function getTypes(product) {
-  return Array.isArray(product?.types) ? product.types : [];
-}
+function getPaymentInfo(data, order) {
+  const settings = data.settings || {};
 
-function getTotalStock(product) {
-  return getTypes(product).reduce(
-    (sum, type) => sum + Number(type.stock || 0),
-    0
-  );
-}
+  const bankCode =
+    settings.bankCode ||
+    settings.bank_code ||
+    BANK_CODE;
 
-function createVietQRUrl(bank, amount, addInfo) {
-  const base =
-    `https://img.vietqr.io/image/` +
-    `${encodeURIComponent(bank.bin)}-` +
-    `${encodeURIComponent(bank.accountNo)}-compact2.png`;
+  const bankAccount =
+    settings.bankAccount ||
+    settings.bank_account ||
+    BANK_ACCOUNT;
 
-  const params = new URLSearchParams({
-    amount: String(amount),
-    addInfo: addInfo,
-    accountName: bank.accountName || ''
-  });
+  const bankAccountName =
+    settings.bankAccountName ||
+    settings.bank_account_name ||
+    BANK_ACCOUNT_NAME;
 
-  return `${base}?${params.toString()}`;
-}
+  const amount = Number(order.price) || 0;
 
-function createProductList(data) {
-  let text = '🛒 *DANH SÁCH SẢN PHẨM*\n\n';
-  const keyboard = [];
+  const transferContent = `DH ${order.id}`;
 
-  data.products.forEach((product) => {
-    const stock = getTotalStock(product);
+  if (bankCode && bankAccount) {
+    const qrUrl =
+      "https://img.vietqr.io/image/" +
+      `${encodeURIComponent(bankCode)}-${encodeURIComponent(bankAccount)}-compact2.png` +
+      `?amount=${encodeURIComponent(amount)}` +
+      `&addInfo=${encodeURIComponent(transferContent)}` +
+      `&accountName=${encodeURIComponent(bankAccountName)}`;
 
-    text += `• *${product.name}* (còn ${stock})\n`;
-
-    keyboard.push([
-      {
-        text: `${product.name} (còn ${stock})`,
-        callback_data: `prod|${product.id}`
-      }
-    ]);
-  });
+    return {
+      bankCode,
+      bankAccount,
+      bankAccountName,
+      amount,
+      transferContent,
+      qrUrl
+    };
+  }
 
   return {
-    text,
-    keyboard
+    bankCode: "",
+    bankAccount: "",
+    bankAccountName: "",
+    amount,
+    transferContent,
+    qrUrl: ""
   };
 }
 
-async function answerCallback(query, options = {}) {
-  try {
-    await bot.answerCallbackQuery(query.id, options);
-  } catch (err) {
-    console.error('Lỗi callback:', err.message);
+// =====================================================
+// ADMIN NOTIFICATION
+// =====================================================
+
+async function notifyAdmins(data, message) {
+  const admins = data.adminTelegramIds || [];
+
+  for (const adminId of admins) {
+    try {
+      await sendMessage(adminId, message);
+    } catch (err) {
+      console.error(
+        "Không gửi được thông báo admin:",
+        String(adminId),
+        err.message
+      );
+    }
+
+    // Tránh gửi tin quá dồn dập.
+    await sleep(1200);
   }
 }
 
-// ==================== /START ====================
+// =====================================================
+// COMMANDS
+// =====================================================
 
-bot.onText(/^\/start(?:@\w+)?(?:\s|$)/, async (msg) => {
-  const chatId = msg.chat.id;
-
-  const data = await getData();
-
-  if (!data) {
-    await bot.sendMessage(
-      chatId,
-      'Hệ thống đang bảo trì, vui lòng thử lại sau.'
-    );
-
-    return;
-  }
-
-  if (data.products.length === 0) {
-    await bot.sendMessage(
-      chatId,
-      'Hiện chưa có sản phẩm nào.'
-    );
-
-    return;
-  }
-
-  const list = createProductList(data);
-
-  await bot.sendMessage(chatId, list.text, {
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: list.keyboard
-    }
-  });
-});
-
-// ==================== /CHECKID ====================
-
-bot.onText(/^\/checkid(?:@\w+)?(?:\s|$)/, async (msg) => {
-  await bot.sendMessage(
-    msg.chat.id,
-    `🆔 Telegram User ID của bạn là:\n\n\`${msg.from.id}\``,
-    {
-      parse_mode: 'Markdown'
-    }
-  );
-});
-
-// ==================== /ORDERS ====================
-
-bot.onText(/^\/orders(?:@\w+)?(?:\s|$)/, async (msg) => {
-  const data = await getData();
-
-  if (!data) {
-    await bot.sendMessage(
-      msg.chat.id,
-      'Không đọc được dữ liệu shop.'
-    );
-
-    return;
-  }
-
-  const adminIds = data.adminIds.map(String);
-
-  if (!adminIds.includes(String(msg.from.id))) {
-    await bot.sendMessage(
-      msg.chat.id,
-      'Bạn không phải Admin.'
-    );
-
-    return;
-  }
-
-  const pending = data.orders.filter(
-    order => order.status === 'waiting_confirm'
-  );
-
-  if (pending.length === 0) {
-    await bot.sendMessage(
-      msg.chat.id,
-      'Không có đơn nào đang chờ admin duyệt.'
-    );
-
-    return;
-  }
-
-  let text = `📋 *Đơn chờ duyệt (${pending.length})*\n\n`;
-
-  pending.slice(0, 10).forEach((order, index) => {
-    text +=
-      `${index + 1}. ${order.id}\n` +
-      `${order.productName} - ${order.typeName}\n` +
-      `${formatMoney(order.price)}\n\n`;
-  });
-
-  await bot.sendMessage(msg.chat.id, text, {
-    parse_mode: 'Markdown'
-  });
-});
-
-// ==================== CALLBACK BUTTONS ====================
-
-bot.on('callback_query', async (query) => {
+bot.onText(/^\/start(?:@\w+)?(?:\s.*)?$/, async (msg) => {
   try {
-    const chatId = query.message?.chat?.id;
-    const messageId = query.message?.message_id;
-    const userId = query.from.id;
-    const callbackData = query.data || '';
+    const chatId = msg.chat.id;
 
-    if (!chatId || !messageId) {
-      await answerCallback(query, {
-        text: 'Không tìm thấy tin nhắn.'
-      });
+    const text =
+      `👋 Xin chào ${msg.from.first_name || "bạn"}!\n\n` +
+      `Chào mừng bạn đến với ${SHOP_NAME}.\n\n` +
+      `🛍 Bấm nút bên dưới để xem sản phẩm.\n` +
+      `📦 Dùng /orders để xem đơn hàng.\n` +
+      `🆔 Dùng /checkid để xem Telegram ID.`;
 
-      return;
-    }
-
-    // Nút hết hàng
-    if (callbackData === 'noop') {
-      await answerCallback(query, {
-        text: 'Gói này đã hết hàng.'
-      });
-
-      return;
-    }
-
-    // Quay lại danh sách sản phẩm
-    if (callbackData === 'back') {
-      const data = await getData();
-
-      if (!data) {
-        await answerCallback(query, {
-          text: 'Không đọc được dữ liệu shop.'
-        });
-
-        return;
+    await sendMessage(chatId, text, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "🛍 XEM SẢN PHẨM",
+              callback_data: "shop"
+            }
+          ],
+          [
+            {
+              text: "📦 ĐƠN HÀNG CỦA TÔI",
+              callback_data: "myorders"
+            }
+          ]
+        ]
       }
+    });
+  } catch (err) {
+    console.error("Lỗi /start:", err.message);
+  }
+});
 
-      const list = createProductList(data);
+bot.onText(/^\/checkid(?:@\w+)?$/, async (msg) => {
+  try {
+    await sendMessage(
+      msg.chat.id,
+      `🆔 Telegram ID của bạn:\n${msg.from.id}`
+    );
+  } catch (err) {
+    console.error("Lỗi /checkid:", err.message);
+  }
+});
 
-      await bot.editMessageText(list.text, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: list.keyboard
-        }
-      });
+bot.onText(/^\/orders(?:@\w+)?$/, async (msg) => {
+  await showMyOrders(msg.chat.id, msg.from.id);
+});
 
-      await answerCallback(query);
-      return;
-    }
+// =====================================================
+// SHOW PRODUCTS
+// =====================================================
 
+async function showProducts(chatId) {
+  try {
     const data = await getData();
 
-    if (!data) {
-      await answerCallback(query, {
-        text: 'Lỗi hệ thống, vui lòng thử lại.'
-      });
+    const products = (data.products || []).filter(
+      (product) => product.active !== false
+    );
 
+    if (!products.length) {
+      await sendMessage(chatId, "Hiện chưa có sản phẩm nào.");
       return;
     }
 
-    // ==================== CHỌN SẢN PHẨM ====================
+    const keyboard = [];
 
-    if (callbackData.startsWith('prod|')) {
-      const productId = callbackData.slice('prod|'.length);
+    for (const product of products) {
+      const types = product.types || [];
 
-      const product = data.products.find(
-        item => String(item.id) === productId
-      );
-
-      if (!product) {
-        await answerCallback(query, {
-          text: 'Sản phẩm không tồn tại.'
-        });
-
-        return;
-      }
-
-      const types = getTypes(product);
-
-      let text =
-        `📦 *${product.name}*\n\n` +
-        `Chọn loại:\n\n`;
-
-      const keyboard = [];
-
-      types.forEach((type) => {
-        const stock = Number(type.stock || 0);
-
-        text +=
-          `• ${type.name}: ${formatMoney(type.price)} ` +
-          `(còn ${stock})\n`;
-
-        keyboard.push([
-          {
-            text: stock > 0
-              ? `${type.name} - ${formatMoney(type.price)}`
-              : `${type.name} (Hết hàng)`,
-
-            callback_data: stock > 0
-              ? `type|${product.id}|${type.id}`
-              : 'noop'
-          }
-        ]);
-      });
+      const minPrice = types.length
+        ? Math.min(...types.map((type) => Number(type.price) || 0))
+        : 0;
 
       keyboard.push([
         {
-          text: '« Quay lại',
-          callback_data: 'back'
+          text: `${product.name} — từ ${money(minPrice)}`,
+          callback_data: `product:${product.id}`
         }
       ]);
+    }
 
-      await bot.editMessageText(text, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
+    await sendMessage(
+      chatId,
+      `🛍 DANH SÁCH SẢN PHẨM\n\nChọn sản phẩm bạn muốn mua:`,
+      {
         reply_markup: {
           inline_keyboard: keyboard
         }
-      });
+      }
+    );
+  } catch (err) {
+    console.error("Lỗi hiển thị sản phẩm:", err.message);
 
-      await answerCallback(query);
+    await sendMessage(
+      chatId,
+      "⚠️ Không tải được sản phẩm. Vui lòng thử lại sau."
+    );
+  }
+}
+
+// =====================================================
+// SHOW PRODUCT TYPES
+// =====================================================
+
+async function showProductTypes(chatId, productId) {
+  try {
+    const data = await getData();
+    const product = findProduct(data, productId);
+
+    if (!product || product.active === false) {
+      await sendMessage(chatId, "Sản phẩm không tồn tại hoặc đã ngừng bán.");
       return;
     }
 
-    // ==================== CHỌN LOẠI SẢN PHẨM ====================
+    const types = product.types || [];
 
-    if (callbackData.startsWith('type|')) {
-      const parts = callbackData.split('|');
+    if (!types.length) {
+      await sendMessage(chatId, "Sản phẩm này chưa có loại/gói bán.");
+      return;
+    }
 
-      const productId = parts[1];
-      const typeId = parts.slice(2).join('|');
+    const keyboard = [];
 
-      const product = data.products.find(
-        item => String(item.id) === productId
-      );
+    for (const type of types) {
+      const stock = getStock(type);
 
-      const type = product
-        ? getTypes(product).find(
-            item => String(item.id) === typeId
-          )
-        : null;
+      const label =
+        `${type.name} — ${money(type.price)}` +
+        ` (Kho: ${stock})`;
 
-      if (!product || !type || Number(type.stock || 0) <= 0) {
-        await answerCallback(query, {
-          text: 'Sản phẩm hoặc gói đã hết hàng.'
-        });
+      keyboard.push([
+        {
+          text: label,
+          callback_data: `type:${product.id}:${type.id}`
+        }
+      ]);
+    }
 
-        return;
+    keyboard.push([
+      {
+        text: "⬅️ Quay lại sản phẩm",
+        callback_data: "shop"
+      }
+    ]);
+
+    const description =
+      `📦 ${product.name}\n\n` +
+      `${getProductDescription(product)}\n\n` +
+      `Chọn loại/gói bạn muốn mua:`;
+
+    await sendMessage(chatId, description, {
+      reply_markup: {
+        inline_keyboard: keyboard
+      }
+    });
+  } catch (err) {
+    console.error("Lỗi hiển thị loại sản phẩm:", err.message);
+
+    await sendMessage(
+      chatId,
+      "⚠️ Không tải được thông tin sản phẩm."
+    );
+  }
+}
+
+// =====================================================
+// CREATE ORDER
+// =====================================================
+
+async function createOrder(chatId, user, productId, typeId) {
+  try {
+    let createdOrder = null;
+
+    await updateData(async (data) => {
+      const product = findProduct(data, productId);
+
+      if (!product || product.active === false) {
+        throw new Error("Sản phẩm không tồn tại hoặc đã ngừng bán.");
       }
 
-      const bank = data.bank || {};
+      const type = findType(product, typeId);
 
-      if (!bank.bin || !bank.accountNo) {
-        await answerCallback(query, {
-          text: 'Shop chưa cấu hình ngân hàng.'
-        });
-
-        return;
+      if (!type) {
+        throw new Error("Loại sản phẩm không tồn tại.");
       }
 
-      const orderId = generateOrderId();
-      const addInfo = `DH ${orderId}`;
+      if (getStock(type) <= 0) {
+        throw new Error("Loại sản phẩm này đã hết hàng.");
+      }
 
-      const qrUrl = createVietQRUrl(
-        bank,
-        type.price,
-        addInfo
-      );
+      const orderId = makeOrderId();
 
-      // Trạng thái pending = chờ thanh toán
-      const newOrder = {
+      createdOrder = {
         id: orderId,
-        userId: userId,
-        username: query.from.username || '',
-        firstName: query.from.first_name || '',
-        fullName: [
-          query.from.first_name,
-          query.from.last_name
-        ].filter(Boolean).join(' '),
-
+        userId: user.id,
+        username: user.username || "",
+        customerName: getUserName(user),
         productId: product.id,
-        typeId: type.id,
-
         productName: product.name,
+        typeId: type.id,
         typeName: type.name,
-
-        price: Number(type.price),
-        status: 'pending',
-
-        key: null,
+        price: Number(type.price) || 0,
+        status: "pending",
         createdAt: new Date().toISOString()
       };
 
-      data.orders.push(newOrder);
+      data.orders.push(createdOrder);
+    });
 
-      const saved = await saveData(data);
+    const data = await getData();
+    const payment = getPaymentInfo(data, createdOrder);
 
-      if (!saved) {
-        await answerCallback(query, {
-          text: 'Không lưu được đơn hàng. Vui lòng thử lại.'
-        });
+    let message =
+      `🧾 ĐƠN HÀNG ĐÃ TẠO\n\n` +
+      `Mã đơn: ${createdOrder.id}\n` +
+      `Sản phẩm: ${createdOrder.productName}\n` +
+      `Loại/gói: ${createdOrder.typeName}\n` +
+      `Số tiền: ${money(createdOrder.price)}\n\n`;
 
-        return;
-      }
+    if (payment.bankAccount) {
+      message +=
+        `🏦 Ngân hàng: ${payment.bankCode}\n` +
+        `💳 Số tài khoản: ${payment.bankAccount}\n` +
+        `👤 Chủ tài khoản: ${payment.bankAccountName}\n` +
+        `💰 Số tiền: ${money(payment.amount)}\n` +
+        `📝 Nội dung chuyển khoản: ${payment.transferContent}\n\n` +
+        `Vui lòng chuyển khoản đúng số tiền và nội dung.`;
+    } else {
+      message +=
+        `Vui lòng liên hệ admin để nhận thông tin thanh toán.`;
+    }
 
-      const caption =
-        `💳 *THANH TOÁN ĐƠN HÀNG*\n\n` +
-        `📦 Sản phẩm: *${product.name} - ${type.name}*\n` +
-        `💰 Số tiền: *${formatMoney(type.price)}*\n` +
-        `🆔 Mã đơn: \`${orderId}\`\n\n` +
-        `Ngân hàng: ${bank.bankName || ''}\n` +
-        `STK: \`${bank.accountNo}\`\n` +
-        `Chủ TK: ${bank.accountName || ''}\n\n` +
-        `Nội dung CK: \`${addInfo}\`\n\n` +
-        `Quét mã QR, chuyển khoản đúng nội dung ` +
-        `rồi bấm *Đã thanh toán*.`;
-
-      await bot.sendPhoto(chatId, qrUrl, {
-        caption: caption,
-        parse_mode: 'Markdown',
+    if (payment.qrUrl) {
+      await sendPhoto(chatId, payment.qrUrl, {
+        caption: message,
         reply_markup: {
           inline_keyboard: [
             [
               {
-                text: '✅ Đã thanh toán',
-                callback_data: `paid|${orderId}`
+                text: "✅ ĐÃ THANH TOÁN",
+                callback_data: `paid:${createdOrder.id}`
+              }
+            ],
+            [
+              {
+                text: "📦 ĐƠN HÀNG CỦA TÔI",
+                callback_data: "myorders"
               }
             ]
           ]
         }
       });
-
-      await answerCallback(query);
-      return;
+    } else {
+      await sendMessage(chatId, message, {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "✅ ĐÃ THANH TOÁN",
+                callback_data: `paid:${createdOrder.id}`
+              }
+            ],
+            [
+              {
+                text: "📦 ĐƠN HÀNG CỦA TÔI",
+                callback_data: "myorders"
+              }
+            ]
+          ]
+        }
+      });
     }
 
-    // ==================== KHÁCH BẤM ĐÃ THANH TOÁN ====================
+    const adminMessage =
+      `🆕 ĐƠN HÀNG MỚI\n\n` +
+      `Mã đơn: ${createdOrder.id}\n` +
+      `Khách: ${createdOrder.customerName}\n` +
+      `Telegram ID: ${createdOrder.userId}\n` +
+      `Sản phẩm: ${createdOrder.productName}\n` +
+      `Loại/gói: ${createdOrder.typeName}\n` +
+      `Giá: ${money(createdOrder.price)}\n` +
+      `Trạng thái: pending`;
 
-    if (callbackData.startsWith('paid|')) {
-      const orderId = callbackData.slice('paid|'.length);
+    await notifyAdmins(data, adminMessage);
+  } catch (err) {
+    console.error("Lỗi tạo đơn:", err.message);
 
-      const order = data.orders.find(
-        item => String(item.id) === orderId
+    await sendMessage(
+      chatId,
+      `⚠️ Không tạo được đơn hàng.\n${err.message}`
+    );
+  }
+}
+
+// =====================================================
+// CUSTOMER MARKED PAID
+// pending -> waiting_confirm
+// =====================================================
+
+async function markOrderPaid(chatId, userId, orderId) {
+  try {
+    let targetOrder = null;
+
+    await updateData(async (data) => {
+      const order = (data.orders || []).find(
+        (item) => String(item.id) === String(orderId)
       );
 
-      // Chỉ cho phép đơn pending chuyển sang waiting_confirm
-      if (!order || order.status !== 'pending') {
-        await answerCallback(query, {
-          text: 'Đơn đã được xử lý hoặc không tồn tại.'
-        });
+      if (!order) throw new Error("Không tìm thấy đơn hàng.");
 
-        return;
+      if (String(order.userId) !== String(userId)) {
+        throw new Error("Bạn không có quyền thao tác đơn hàng này.");
       }
 
-      // Admin Shop đang dùng waiting_confirm để duyệt đơn
-      order.status = 'waiting_confirm';
-      order.paidAt = new Date().toISOString();
-
-      const saved = await saveData(data);
-
-      if (!saved) {
-        await answerCallback(query, {
-          text: 'Không cập nhật được đơn. Vui lòng thử lại.'
-        });
-
-        return;
+      if (order.status !== "pending") {
+        throw new Error("Đơn hàng không ở trạng thái chờ thanh toán.");
       }
 
-      const adminIds = data.adminIds || [];
+      order.status = "waiting_confirm";
+      order.paidRequestedAt = new Date().toISOString();
 
-      const notifyText =
-        `🔔 *ĐƠN HÀNG MỚI CẦN DUYỆT*\n\n` +
-        `🆔 Mã: \`${order.id}\`\n` +
-        `👤 ${order.fullName || order.username || 'Khách'} ` +
-        `(@${order.username || 'none'})\n` +
-        `ID: ${order.userId}\n` +
-        `📦 ${order.productName} - ${order.typeName}\n` +
-        `💰 ${formatMoney(order.price)}`;
+      targetOrder = order;
+    });
 
-      // Gửi thông báo cho admin
-      for (const adminId of adminIds) {
-        try {
-          await bot.sendMessage(
-            adminId,
-            notifyText,
-            {
-              parse_mode: 'Markdown'
-            }
-          );
-        } catch (err) {
-          console.error(
-            `Không gửi được thông báo admin ${adminId}:`,
-            err.message
-          );
-        }
-      }
+    const data = await getData();
 
-      // Cập nhật caption tin nhắn khách
-      try {
-        await bot.editMessageCaption(
-          `⏳ *YÊU CẦU ĐÃ GỬI ADMIN*\n\n` +
-          `Mã đơn: \`${orderId}\`\n` +
-          `Sản phẩm: ${order.productName} - ${order.typeName}\n` +
-          `Số tiền: ${formatMoney(order.price)}`,
+    await sendMessage(
+      chatId,
+      `✅ Đã gửi yêu cầu xác nhận thanh toán.\n\n` +
+        `Mã đơn: ${targetOrder.id}\n\n` +
+        `VUI LÒNG CHỜ ADMIN DUYỆT TRONG ÍT PHÚT….`
+    );
 
-          {
-            chat_id: chatId,
-            message_id: messageId,
-            parse_mode: 'Markdown'
-          }
-        );
-      } catch (err) {
-        console.error(
-          'Không sửa được caption:',
-          err.message
-        );
-      }
+    const adminMessage =
+      `🔔 KHÁCH BÁO ĐÃ THANH TOÁN\n\n` +
+      `Mã đơn: ${targetOrder.id}\n` +
+      `Khách Telegram ID: ${targetOrder.userId}\n` +
+      `Sản phẩm: ${targetOrder.productName}\n` +
+      `Loại/gói: ${targetOrder.typeName}\n` +
+      `Số tiền: ${money(targetOrder.price)}\n` +
+      `Trạng thái: waiting_confirm\n\n` +
+      `Vui lòng kiểm tra giao dịch và duyệt đơn trong trang Admin.`;
 
-      await answerCallback(query, {
-        text: 'Đã gửi yêu cầu duyệt cho admin.'
-      });
+    await notifyAdmins(data, adminMessage);
+  } catch (err) {
+    console.error("Lỗi xác nhận thanh toán:", err.message);
+
+    await sendMessage(chatId, `⚠️ ${err.message}`);
+  }
+}
+
+// =====================================================
+// CUSTOMER ORDERS
+// =====================================================
+
+async function showMyOrders(chatId, userId) {
+  try {
+    const data = await getData();
+
+    const orders = (data.orders || [])
+      .filter((order) => String(order.userId) === String(userId))
+      .sort(
+        (a, b) =>
+          new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
+      )
+      .slice(0, 10);
+
+    if (!orders.length) {
+      await sendMessage(chatId, "Bạn chưa có đơn hàng nào.");
+      return;
+    }
+
+    const statusNames = {
+      pending: "Chờ thanh toán",
+      waiting_confirm: "Chờ admin xác nhận",
+      paid: "Đã thanh toán / hoàn tất",
+      cancelled: "Đã hủy"
+    };
+
+    let message = "📦 ĐƠN HÀNG CỦA BẠN\n\n";
+
+    for (const order of orders) {
+      message +=
+        `Mã đơn: ${order.id}\n` +
+        `Sản phẩm: ${order.productName || ""}\n` +
+        `Loại/gói: ${order.typeName || ""}\n` +
+        `Giá: ${money(order.price)}\n` +
+        `Trạng thái: ${statusNames[order.status] || order.status}\n\n`;
+    }
+
+    await sendMessage(chatId, message);
+  } catch (err) {
+    console.error("Lỗi xem đơn hàng:", err.message);
+
+    await sendMessage(
+      chatId,
+      "⚠️ Không tải được đơn hàng. Vui lòng thử lại."
+    );
+  }
+}
+
+// =====================================================
+// CALLBACK QUERY
+// =====================================================
+
+bot.on("callback_query", async (query) => {
+  const chatId = query.message?.chat?.id;
+  const userId = query.from.id;
+  const data = query.data || "";
+
+  try {
+    await answerCallback(query.id);
+
+    if (!chatId) return;
+
+    if (data === "shop") {
+      await showProducts(chatId);
+      return;
+    }
+
+    if (data === "myorders") {
+      await showMyOrders(chatId, userId);
+      return;
+    }
+
+    if (data.startsWith("product:")) {
+      const productId = data.slice("product:".length);
+
+      await showProductTypes(chatId, productId);
+      return;
+    }
+
+    if (data.startsWith("type:")) {
+      const parts = data.split(":");
+
+      const productId = parts[1];
+      const typeId = parts[2];
+
+      await createOrder(
+        chatId,
+        query.from,
+        productId,
+        typeId
+      );
 
       return;
     }
 
-    await answerCallback(query, {
-      text: 'Nút không hợp lệ hoặc đã hết hạn.'
-    });
+    if (data.startsWith("paid:")) {
+      const orderId = data.slice("paid:".length);
 
+      await markOrderPaid(chatId, userId, orderId);
+      return;
+    }
   } catch (err) {
-    console.error(
-      'Lỗi callback_query:',
-      err.message
-    );
+    console.error("Lỗi callback:", err.message);
 
-    await answerCallback(query, {
-      text: 'Có lỗi xảy ra, vui lòng thử lại.'
-    });
+    if (chatId) {
+      await sendMessage(
+        chatId,
+        "⚠️ Có lỗi xảy ra. Vui lòng thử lại."
+      ).catch(() => {});
+    }
   }
 });
 
-// ==================== POLLING ERROR ====================
+// =====================================================
+// MESSAGE ERROR HANDLING
+// =====================================================
 
-bot.on('polling_error', (err) => {
-  const status =
-    err.response?.statusCode ||
-    err.response?.status;
-
-  const retryAfter =
-    err.response?.body?.parameters?.retry_after;
-
-  console.error(
-    'Polling error:',
-    status || '',
-    err.message,
-    retryAfter
-      ? `| Telegram yêu cầu chờ ${retryAfter} giây`
-      : ''
-  );
+bot.on("polling_error", (err) => {
+  console.error("Telegram polling error:", err.message);
 });
 
-bot.on('error', (err) => {
-  console.error(
-    'Telegram bot error:',
-    err.message
-  );
+bot.on("webhook_error", (err) => {
+  console.error("Telegram webhook error:", err.message);
 });
 
-console.log('Bot đã khởi động. Đang kết nối Telegram...');
+// =====================================================
+// MANUAL POLLING LOOP
+// - Chỉ một getUpdates chạy tại một thời điểm.
+// - Tôn trọng retry_after khi Telegram trả 429.
+// - Không tự gọi startPolling nhiều lần.
+// =====================================================
+
+let pollingStopped = false;
+let updateOffset = 0;
+
+async function pollingLoop() {
+  console.log("Bot đang bắt đầu kết nối Telegram...");
+
+  while (!pollingStopped) {
+    try {
+      const updates = await bot.getUpdates({
+        offset: updateOffset,
+        timeout: 30,
+        allowed_updates: ["message", "callback_query"]
+      });
+
+      if (!Array.isArray(updates)) {
+        await sleep(1000);
+        continue;
+      }
+
+      for (const update of updates) {
+        updateOffset = update.update_id + 1;
+
+        try {
+          bot.processUpdate(update);
+        } catch (err) {
+          console.error("Lỗi xử lý update:", err.message);
+        }
+      }
+    } catch (err) {
+      const code = getTelegramErrorCode(err);
+      const retryAfter = Number(getTelegramRetryAfter(err)) || 0;
+
+      if (code === 429 || retryAfter > 0) {
+        const waitMs = Math.max(retryAfter * 1000, 1000) + 1000;
+
+        console.warn(
+          `Telegram 429: chờ ${Math.ceil(waitMs / 1000)} giây rồi thử lại.`
+        );
+
+        await sleep(waitMs);
+        continue;
+      }
+
+      if (code === 409) {
+        console.error(
+          "Telegram 409: Có tiến trình khác đang getUpdates bằng token này. " +
+          "Hãy tắt bot chạy trùng."
+        );
+
+        await sleep(15000);
+        continue;
+      }
+
+      console.error("Lỗi polling:", err.message);
+
+      await sleep(5000);
+    }
+  }
+}
+
+// =====================================================
+// START
+// =====================================================
+
+async function startBot() {
+  try {
+    // Kiểm tra JSONBin trước khi bắt đầu nhận update.
+    await getData();
+
+    console.log("JSONBin kết nối thành công.");
+    console.log("Shop:", SHOP_NAME);
+    console.log("Bot đã khởi động.");
+
+    pollingLoop().catch((err) => {
+      console.error("Polling loop bị dừng:", err.message);
+    });
+  } catch (err) {
+    console.error("Không thể khởi động bot:", err.message);
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", () => {
+  console.log("Nhận SIGTERM, đang dừng bot...");
+  pollingStopped = true;
+});
+
+process.on("SIGINT", () => {
+  console.log("Nhận SIGINT, đang dừng bot...");
+  pollingStopped = true;
+});
+
+startBot();
